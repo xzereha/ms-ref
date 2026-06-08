@@ -1,0 +1,122 @@
+#!/bin/sh
+# vault/init.sh — Vault container entrypoint.
+#
+# Responsibilities (in order):
+#   1. Start Vault server in background with the file-backed config
+#   2. If Vault has NOT been initialized yet (first-ever run):
+#       a. Initialise with a single unseal key (dev convenience — real
+#          production splits this across N operators)
+#       b. Unseal
+#       c. Enable KV v2 secrets engine at microservices/
+#       d. Generate an RS256 key pair and store it
+#       e. Create one Vault policy per service (least privilege)
+#       f. Issue a long-lived (720 h) token for each service
+#       g. Write tokens to the shared volume so service containers can read them
+#   3. If Vault IS already initialized (subsequent runs):
+#       a. Unseal with the stored key — data survives from the previous run
+#   4. Bring Vault to foreground
+#
+# Shared volume layout:
+#   /vault/file/       — persistent Vault storage (survives restarts)
+#   /vault/secrets/    — written by this script, mounted at /run/secrets/ on
+#                        every service container so VaultConfig can find tokens
+#   /vault/file/init.json  — init output (unseal key + root token), kept only
+#                            for operational reference; service tokens are
+#                            regenerated only when missing
+
+set -e
+
+VAULT_CONFIG="/vault/config/vault.hcl"
+VAULT_FILE="/vault/file"
+SHARED_SECRETS="/vault/secrets"
+INIT_FILE="$VAULT_FILE/init.json"
+UNSEAL_KEY_FILE="$VAULT_FILE/unseal_key"
+
+mkdir -p "$VAULT_FILE" "$SHARED_SECRETS"
+
+# ── 1. Start Vault server in background ────────────────────────────────────
+vault server -config="$VAULT_CONFIG" &
+VAULT_PID=$!
+sleep 2
+
+# ── 2. Check if already initialised ────────────────────────────────────────
+if [ ! -f "$INIT_FILE" ]; then
+
+    echo "=== First run — initialising Vault ==="
+
+    # Install tools needed for bootstrap
+    apk add --no-cache openssl jq >/dev/null 2>&1
+
+    # Initialise with single-key threshold (dev-only — use 5/3 in production)
+    vault operator init \
+        -key-shares=1 \
+        -key-threshold=1 \
+        -format=json > "$INIT_FILE"
+
+    UNSEAL_KEY=$(jq -r '.unseal_keys_b64[0]' "$INIT_FILE")
+    ROOT_TOKEN=$(jq -r '.root_token' "$INIT_FILE")
+
+    echo "$UNSEAL_KEY" > "$UNSEAL_KEY_FILE"
+
+    echo "=== Unsealing ==="
+    vault operator unseal "$UNSEAL_KEY"
+
+    echo "=== Authenticating ==="
+    vault login "$ROOT_TOKEN"
+
+    echo "=== Enabling KV v2 at microservices/ ==="
+    vault secrets enable -path=microservices kv-v2 2>/dev/null || true
+
+    echo "=== Generating RSA key pair ==="
+    openssl genpkey -algorithm RSA -pkeyopt rsa_keygen_bits:2048 \
+        -out /tmp/private.pem 2>/dev/null
+    openssl pkey -in /tmp/private.pem -pubout \
+        -out /tmp/public.pem 2>/dev/null
+
+    vault kv put microservices/jwt \
+        private_key=@/tmp/private.pem \
+        public_key=@/tmp/public.pem
+
+    rm -f /tmp/private.pem /tmp/public.pem
+
+    echo "=== Creating service policies ==="
+    for svc in api-gateway user-service booking-service; do
+        vault policy write "$svc" - <<POLICY 2>/dev/null || true
+path "microservices/data/jwt" {
+  capabilities = ["read"]
+}
+POLICY
+    done
+
+    echo "=== Issuing service tokens ==="
+    for svc in api-gateway user-service booking-service; do
+        vault token create \
+            -policy="$svc" \
+            -ttl=720h \
+            -field=token > "$SHARED_SECRETS/vault-token-$svc"
+    done
+
+    echo "✅ Vault initialised and bootstrapped"
+
+else
+    echo "=== Vault already initialised — unsealing ==="
+    UNSEAL_KEY=$(cat "$UNSEAL_KEY_FILE")
+    vault operator unseal "$UNSEAL_KEY"
+fi
+
+# ── 3. Ensure tokens exist (they might have been deleted from the shared vol) ─
+if [ ! -f "$SHARED_SECRETS/vault-token-api-gateway" ]; then
+    echo "=== Refreshing service tokens ==="
+    apk add --no-cache jq >/dev/null 2>&1
+    ROOT_TOKEN=$(jq -r '.root_token' "$INIT_FILE")
+    vault login "$ROOT_TOKEN"
+    for svc in api-gateway user-service booking-service; do
+        vault token create \
+            -policy="$svc" \
+            -ttl=720h \
+            -field=token > "$SHARED_SECRETS/vault-token-$svc"
+    done
+fi
+
+# ── 4. Bring Vault to foreground ───────────────────────────────────────────
+wait $VAULT_PID

@@ -1,0 +1,119 @@
+# docker-compose.yml
+# Microservices project — POC deployment with Vault for secret distribution.
+#
+# Vault runs in production-style server mode (file-backed storage), so keys
+# and tokens survive container restarts.
+# vault/init.sh handles first-run bootstrap and subsequent unseals.
+# Tokens are shared through a named volume at /run/secrets/ on every service.
+
+services:
+
+  # ── Vault (file-backed, production-style) ──────────────────────────────────
+  vault:
+    image: hashicorp/vault:latest
+    container_name: vault
+    user: root                    # apk needs root for openssl+jq during bootstrap
+    cap_add:
+      - IPC_LOCK
+    environment:
+      VAULT_ADDR: http://127.0.0.1:8200
+    volumes:
+      - ./vault/config:/vault/config:ro
+      - ./vault/init.sh:/vault/init.sh:ro
+      - vault-data:/vault/file
+      - vault-secrets:/vault/secrets
+    ports:
+      - "8202:8200"
+    entrypoint: ["/bin/sh", "/vault/init.sh"]
+    healthcheck:
+      test: ["CMD", "vault", "status"]
+      interval: 5s
+      retries: 20
+      start_period: 15s
+
+  # ── Service Registry (Eureka) ─────────────────────────────────────────────
+  service-registry:
+    build:
+      context: .
+      dockerfile: service-registry/Dockerfile
+    container_name: service-registry
+    ports:
+      - "8761:8761"
+    volumes:
+      - vault-secrets:/run/secrets:ro
+    environment:
+      VAULT_TOKEN: ""
+      VAULT_ADDR: http://vault:8200
+      EUREKA_CLIENT_SERVICEURL_DEFAULTZONE: http://service-registry:8761/eureka
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8761/actuator/health"]
+      interval: 10s
+      retries: 5
+      start_period: 30s
+    depends_on:
+      vault:
+        condition: service_healthy
+
+  # ── User Service ──────────────────────────────────────────────────────────
+  user-service:
+    build:
+      context: .
+      dockerfile: user-service/Dockerfile
+    container_name: user-service
+    volumes:
+      - vault-secrets:/run/secrets:ro
+    environment:
+      VAULT_TOKEN: ""
+      VAULT_ADDR: http://vault:8200
+      EUREKA_CLIENT_SERVICEURL_DEFAULTZONE: http://service-registry:8761/eureka
+      SERVER_PORT: 8081
+    depends_on:
+      vault:
+        condition: service_healthy
+      service-registry:
+        condition: service_healthy
+
+  # ── Booking Service ───────────────────────────────────────────────────────
+  booking-service:
+    build:
+      context: .
+      dockerfile: booking-service/Dockerfile
+    container_name: booking-service
+    volumes:
+      - vault-secrets:/run/secrets:ro
+    environment:
+      VAULT_TOKEN: ""
+      VAULT_ADDR: http://vault:8200
+      EUREKA_CLIENT_SERVICEURL_DEFAULTZONE: http://service-registry:8761/eureka
+      SERVER_PORT: 8082
+    depends_on:
+      vault:
+        condition: service_healthy
+      service-registry:
+        condition: service_healthy
+
+  # ── API Gateway (public entry point) ──────────────────────────────────────
+  api-gateway:
+    build:
+      context: .
+      dockerfile: api-gateway/Dockerfile
+    container_name: api-gateway
+    ports:
+      - "8080:8080"
+    volumes:
+      - vault-secrets:/run/secrets:ro
+    environment:
+      VAULT_TOKEN: ""
+      VAULT_ADDR: http://vault:8200
+      EUREKA_CLIENT_SERVICEURL_DEFAULTZONE: http://service-registry:8761/eureka
+      SERVER_PORT: 8080
+    depends_on:
+      vault:
+        condition: service_healthy
+      service-registry:
+        condition: service_healthy
+
+# ── Named Volumes ──────────────────────────────────────────────────────────
+volumes:
+  vault-data:
+  vault-secrets:

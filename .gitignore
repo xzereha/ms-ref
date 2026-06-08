@@ -1,0 +1,20 @@
+build/
+.gradle/
+*.jar
+*.war
+.idea/
+*.iml
+*.ipr
+*.iws
+out/
+.settings/
+.project
+.classpath
+.vscode/
+bin/
+*.log
+.env
+
+# Generated secrets — do not commit
+.docker/
+config/jwt/

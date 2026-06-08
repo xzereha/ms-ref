@@ -1,0 +1,26 @@
+spring:
+  application:
+    name: api-gateway
+
+  autoconfigure:
+    exclude: org.springframework.boot.autoconfigure.security.servlet.UserDetailsServiceAutoConfiguration
+
+  # Booking requests are forwarded manually via BookingProxyController instead of
+  # Spring Cloud Gateway routes, because the gateway-server-webmvc starter does
+  # not reliably route via YAML configuration in this setup.
+
+server:
+  port: 8080
+
+eureka:
+  client:
+    serviceUrl:
+      defaultZone: http://service-registry:8761/eureka/
+
+# Vault configuration — the token is resolved from VAULT_TOKEN env var or
+# a Docker secret file at /run/secrets/vault-token-${spring.application.name}.
+# The api-gateway fetches BOTH the private and public RSA keys from Vault
+# because it needs to sign tokens (login) and verify them (incoming requests).
+vault:
+  addr: ${VAULT_ADDR:http://vault:8200}
+  token: ${VAULT_TOKEN:}
